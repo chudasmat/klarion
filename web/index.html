@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sticky Note</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="note-container">
+        <div class="title-bar pywebview-drag-region">
+            <div class="controls-left">
+                <button id="pin-btn" class="icon-btn" title="Pin to top">
+                   <!-- Pin Icon (Simple SVG) -->
+                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="12" y1="17" x2="12" y2="22"></line>
+                        <path d="M5 17h14v-1.76l-2-2V7a5 5 0 0 0-10 0v6.24l-2 2"></path>
+                   </svg>
+                </button>
+            </div>
+            
+            <div class="controls-center">
+                 <input type="range" id="opacity-slider" min="0.2" max="1" step="0.05" value="0.95" title="Transparency">
+            </div>
+
+            <div class="controls-right">
+                <button id="close-btn" class="icon-btn danger" title="Close">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        <textarea id="note-content" placeholder="Type a note..."></textarea>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
