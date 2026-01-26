@@ -6,22 +6,138 @@ import time
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QSlider, QTextEdit, 
                                QSizeGrip, QFrame, QLabel, QScrollArea)
-from PySide6.QtCore import Qt, QPoint, QSize, QPropertyAnimation, QEasingCurve, Signal
+from PySide6.QtCore import Qt, QPoint, QSize, QPropertyAnimation, QEasingCurve, Signal, QObject
 from PySide6.QtGui import QColor, QIcon, QFont, QCursor
+import shutil
+
+class NoteManager(QObject):
+    """Singleton-like manager for shared state across windows."""
+    notes_updated = Signal() # Emitted when list changes (add/delete)
+    note_content_changed = Signal(str, str) # note_id, new_content
+    settings_changed = Signal() # Emitted when global settings change (theme, pin, opacity)
+
+    def __init__(self):
+        super().__init__()
+        self.app_data_dir = os.path.join(os.getenv('LOCALAPPDATA'), 'Klarion')
+        os.makedirs(self.app_data_dir, exist_ok=True)
+        self.notes_file = os.path.join(self.app_data_dir, "notes_data.json")
+        
+        self.notes_data = [] 
+        self.settings = {
+            "pinned": False,
+            "opacity": 240,
+            "theme_index": 0
+        }
+        
+        self.migrate_old_data()
+        self.load_data()
+        self.ensure_at_least_one_note()
+
+    def migrate_old_data(self):
+        # Migration: Check for local file
+        local_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes_data.json")
+        cwd_file = "notes_data.json"
+        
+        if not os.path.exists(self.notes_file):
+            if os.path.exists(local_file):
+                try:
+                    shutil.move(local_file, self.notes_file)
+                except Exception: pass
+            elif os.path.exists(cwd_file):
+                 try:
+                    shutil.move(cwd_file, self.notes_file)
+                 except Exception: pass
+
+    def load_data(self):
+        if os.path.exists(self.notes_file):
+            try:
+                with open(self.notes_file, "r") as f:
+                    data = json.load(f)
+                    
+                    if "notes" in data:
+                        self.notes_data = data.get("notes", [])
+                        self.settings = data.get("settings", self.settings)
+                    else:
+                        # Legacy format migration
+                        content = data.get("content", "")
+                        note_id = str(uuid.uuid4())
+                        self.notes_data = [{"id": note_id, "content": content, "timestamp": time.time()}]
+                        
+                        self.settings["pinned"] = data.get("pinned", False)
+                        self.settings["opacity"] = data.get("opacity", 240)
+                        self.settings["theme_index"] = data.get("theme_index", 0)
+
+            except Exception as e:
+                print(f"Error loading: {e}")
+
+    def save_data(self):
+        data = {
+            "notes": self.notes_data,
+            "settings": self.settings
+        }
+        try:
+            with open(self.notes_file, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"Error saving: {e}")
+
+    def ensure_at_least_one_note(self):
+        if not self.notes_data:
+            self.create_new_note(save=False)
+
+    def create_new_note(self, save=True):
+        new_id = str(uuid.uuid4())
+        new_note = {"id": new_id, "content": "", "timestamp": time.time()}
+        self.notes_data.insert(0, new_note)
+        if save:
+            self.save_data()
+        self.notes_updated.emit()
+        return new_id
+
+    def delete_note(self, note_id):
+        self.notes_data = [n for n in self.notes_data if n["id"] != note_id]
+        if not self.notes_data:
+            self.create_new_note(save=False)
+        self.save_data()
+        self.notes_updated.emit()
+
+    def update_note_content(self, note_id, content):
+        for note in self.notes_data:
+            if note["id"] == note_id:
+                note["content"] = content
+                note["timestamp"] = time.time()
+                break
+        self.save_data()
+        self.note_content_changed.emit(note_id, content)
+
+    def get_note_content(self, note_id):
+        note = next((n for n in self.notes_data if n["id"] == note_id), None)
+        return note["content"] if note else ""
+
+    def update_setting(self, key, value):
+        self.settings[key] = value
+        self.save_data()
+        self.settings_changed.emit()
 
 class NoteItemWidget(QFrame):
     """A single row in the side menu representing a note."""
     clicked = Signal(str) # note_id
     delete_clicked = Signal(str) # note_id
+    popout_clicked = Signal(str) # note_id
 
-    def __init__(self, note_id, content):
+    def __init__(self, note_id, content, is_active):
         super().__init__()
         self.note_id = note_id
         self.setFixedHeight(50)
         self.setCursor(Qt.PointingHandCursor)
         
+        # Style based on active state
+        bg_style = "background-color: rgba(255, 255, 255, 0.1); border-radius: 5px;" if is_active else ""
+        self.setStyleSheet(f"NoteItemWidget {{ {bg_style} }}")
+
         self.layout = QHBoxLayout(self)
         self.layout.setContentsMargins(5, 5, 5, 5)
+        self.layout.setSpacing(5)
         
         # Preview Text
         preview = content.strip().split('\n')[0][:20]
@@ -29,22 +145,30 @@ class NoteItemWidget(QFrame):
         
         self.lbl = QLabel(preview)
         self.lbl.setStyleSheet("color: white; border: none; background: transparent;")
+        self.lbl.setAttribute(Qt.WA_TransparentForMouseEvents) # Let click pass through to frame
         
+        # Pop Out Button
+        self.pop_btn = QPushButton("⧉")
+        self.pop_btn.setFixedSize(20, 20)
+        self.pop_btn.setToolTip("Open in new window")
+        self.pop_btn.setStyleSheet("""
+            QPushButton { background: transparent; color: #aaa; border: none; font-size: 14px; }
+            QPushButton:hover { color: #60cdff; }
+        """)
+        self.pop_btn.clicked.connect(self.on_popout)
+
         # Delete Button
         self.del_btn = QPushButton("🗑") # Trash icon
         self.del_btn.setFixedSize(20, 20)
         self.del_btn.setStyleSheet("""
-            QPushButton { 
-                background: transparent; color: #aaa; border: none; 
-            }
-            QPushButton:hover { 
-                color: #ff5f57; 
-            }
+            QPushButton { background: transparent; color: #aaa; border: none; }
+            QPushButton:hover { color: #ff5f57; }
         """)
         self.del_btn.clicked.connect(self.on_delete)
         
         self.layout.addWidget(self.lbl)
         self.layout.addStretch()
+        self.layout.addWidget(self.pop_btn)
         self.layout.addWidget(self.del_btn)
         
         self.setObjectName("NoteItem")
@@ -56,10 +180,17 @@ class NoteItemWidget(QFrame):
     def on_delete(self):
         self.delete_clicked.emit(self.note_id)
 
+    def on_popout(self):
+        self.popout_clicked.emit(self.note_id)
+
 class SideMenu(QWidget):
     """Sliding side menu."""
-    def __init__(self, parent=None):
+    def __init__(self, manager, current_note_id, note_window, parent=None):
         super().__init__(parent)
+        self.manager = manager
+        self.current_note_id = current_note_id
+        self.note_window = note_window # Explicit reference to controller
+        
         self.setFixedWidth(0) # Initially closed
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet("background-color: rgba(20, 20, 20, 0.95); border-right: 1px solid rgba(255,255,255,0.1);")
@@ -95,7 +226,29 @@ class SideMenu(QWidget):
         self.scroll.setWidget(self.scroll_content)
         self.layout.addWidget(self.scroll)
 
-import shutil
+    def set_current_note(self, note_id):
+        self.current_note_id = note_id
+        self.refresh_list()
+
+    def refresh_list(self):
+        # Clear existing items
+        layout = self.scroll_layout
+        while layout.count() > 1: # Keep the stretch item at end
+            child = layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        
+        # Add items
+        for note in self.manager.notes_data:
+            is_active = (note["id"] == self.current_note_id)
+            item = NoteItemWidget(note["id"], note["content"], is_active)
+            
+            # Connect signals to note_window slots
+            item.clicked.connect(self.note_window.switch_note)
+            item.delete_clicked.connect(self.note_window.delete_note)
+            item.popout_clicked.connect(self.note_window.open_popout)
+               
+            layout.insertWidget(layout.count()-1, item)
 
 class StickyNote(QMainWindow):
     THEMES = [
@@ -106,67 +259,51 @@ class StickyNote(QMainWindow):
         {"name": "Mint", "bg": (200, 255, 200), "text": "#000000", "border": "rgba(0, 0, 0, 30)"},
     ]
 
-    def __init__(self):
+    # Keep track of active windows to prevent garbage collection
+    active_windows = []
+
+    def __init__(self, manager, note_id=None):
         super().__init__()
-        
-        # Determine AppData path
-        app_data_dir = os.path.join(os.getenv('LOCALAPPDATA'), 'Klarion')
-        os.makedirs(app_data_dir, exist_ok=True)
-        self.notes_file = os.path.join(app_data_dir, "notes_data.json")
-        
-        # Migration: Check for local file
-        local_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes_data.json")
-        # Also check cwd just in case
-        cwd_file = "notes_data.json"
-        
-        if not os.path.exists(self.notes_file):
-            if os.path.exists(local_file):
-                try:
-                    shutil.move(local_file, self.notes_file)
-                    print(f"Migrated data from {local_file} to {self.notes_file}")
-                except Exception as e:
-                    print(f"Migration failed: {e}")
-            elif os.path.exists(cwd_file):
-                 try:
-                    shutil.move(cwd_file, self.notes_file)
-                    print(f"Migrated data from {cwd_file} to {self.notes_file}")
-                 except Exception as e:
-                    print(f"Migration failed: {e}")
+        self.manager = manager
+        StickyNote.active_windows.append(self)
 
-        self.is_pinned = False
-        self.current_opacity = 240
-        self.theme_index = 0
-        
-        self.notes_data = [] # List of dicts {id, content, timestamp}
-        self.active_note_id = None
+        # ID setup
+        if note_id:
+            self.note_id = note_id
+        else:
+            # Default to first available or create new
+            if not self.manager.notes_data:
+                self.manager.create_new_note(save=False)
+            self.note_id = self.manager.notes_data[0]["id"]
 
-        # Window Setup
+        # Connect Manager Signals
+        self.manager.notes_updated.connect(self.on_notes_list_updated)
+        self.manager.note_content_changed.connect(self.on_external_content_change)
+        self.manager.settings_changed.connect(self.on_settings_atomic_change)
+
+        # UI Setup
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(350, 400)
         
-        # --- Main UI Construction ---
         self.central_widget = QWidget()
         self.central_widget.setObjectName("Container")
         self.setCentralWidget(self.central_widget)
         
-        self.root_layout = QHBoxLayout(self.central_widget) # Horizontal: [Menu] [Content]
+        self.root_layout = QHBoxLayout(self.central_widget)
         self.root_layout.setContentsMargins(0, 0, 0, 0)
         self.root_layout.setSpacing(0)
 
-        # Side Menu (Added to layout typically, but for sliding OVERLAY effect, 
-        # it's often better to NOT be in the layout or animate layout stretch.
-        # Here we will put it in the layout but animate its width.)
-        self.side_menu = SideMenu()
+        # Side Menu
+        self.side_menu = SideMenu(self.manager, self.note_id, self, self)
         self.side_menu.add_btn.clicked.connect(self.create_new_note)
         self.root_layout.addWidget(self.side_menu)
 
-        # Main Content Wrapper
+        # Main Content
         self.content_area = QWidget()
         self.content_layout = QVBoxLayout(self.content_area)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(0)
-        
         self.root_layout.addWidget(self.content_area)
 
         # Title Bar
@@ -176,7 +313,6 @@ class StickyNote(QMainWindow):
         self.header_layout = QHBoxLayout(self.title_bar)
         self.header_layout.setContentsMargins(5, 0, 5, 0)
 
-        # Burger Button
         self.menu_btn = QPushButton("≡")
         self.menu_btn.setFixedSize(30, 30)
         self.menu_btn.clicked.connect(self.toggle_menu)
@@ -193,45 +329,43 @@ class StickyNote(QMainWindow):
         self.theme_btn.clicked.connect(self.cycle_theme)
         self.theme_btn.setCursor(Qt.PointingHandCursor)
 
-        self.slider_label = QLabel("👁")
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setRange(50, 255)
-        self.slider.setValue(240)
-        self.slider.setFixedWidth(60)
-        self.slider.valueChanged.connect(self.update_opacity)
-
-        self.close_btn = QPushButton("✕")
-        self.close_btn.setFixedSize(30, 30)
-        self.close_btn.clicked.connect(self.close_app)
-        self.close_btn.setObjectName("CloseBtn")
-        self.close_btn.setCursor(Qt.PointingHandCursor)
-        
-        self.header_layout.addWidget(self.menu_btn) # Burger first!
+        self.header_layout.addWidget(self.menu_btn)
         self.header_layout.addWidget(self.pin_btn)
         self.header_layout.addWidget(self.theme_btn)
         self.header_layout.addStretch()
+
+        # Opacity Slider
+        self.slider_label = QLabel("👁") # Eye icon
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(50, 255)
+        self.slider.setFixedWidth(60)
+        self.slider.valueChanged.connect(self.update_opacity_val)
+        
         self.header_layout.addWidget(self.slider_label)
         self.header_layout.addWidget(self.slider)
         self.header_layout.addStretch()
 
-        # Minimize Button
         self.min_btn = QPushButton("─")
         self.min_btn.setFixedSize(30, 30)
         self.min_btn.clicked.connect(self.showMinimized)
         self.min_btn.setCursor(Qt.PointingHandCursor)
         self.header_layout.addWidget(self.min_btn)
 
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedSize(30, 30)
+        self.close_btn.clicked.connect(self.close) # Just close window
+        self.close_btn.setObjectName("CloseBtn")
+        self.close_btn.setCursor(Qt.PointingHandCursor)
         self.header_layout.addWidget(self.close_btn)
 
         self.content_layout.addWidget(self.title_bar)
 
-        # Text Edit
+        # Editor
         self.text_edit = QTextEdit()
         self.text_edit.setFrameStyle(QFrame.NoFrame)
         self.text_edit.setPlaceholderText("Type a note...")
         self.text_edit.setObjectName("Content")
         self.text_edit.textChanged.connect(self.on_text_changed)
-        
         self.content_layout.addWidget(self.text_edit)
 
         # Resize Grip
@@ -241,195 +375,130 @@ class StickyNote(QMainWindow):
         self.bottom_layout = QHBoxLayout(self.bottom_bar)
         self.bottom_layout.setContentsMargins(0, 0, 0, 0)
         self.bottom_layout.addStretch()
-        self.grip = QSizeGrip(self.content_area) # Parented to content!
+        self.grip = QSizeGrip(self.content_area)
         self.grip.setFixedSize(20, 20)
         self.bottom_layout.addWidget(self.grip)
-        
         self.content_layout.addWidget(self.bottom_bar)
 
-        # Animation
+        # Menu Animation
         self.menu_animation = QPropertyAnimation(self.side_menu, b"maximumWidth")
         self.menu_animation.setDuration(300)
         self.menu_animation.setEasingCurve(QEasingCurve.InOutQuad)
         self.menu_open = False
 
-        # Dragging logic
         self.old_pos = None
 
-        # Init
-        self.load_data()
-        self.update_style()
+        # Apply State
+        self.apply_global_settings()
+        self.load_content()
+        self.side_menu.refresh_list()
 
-    def load_data(self):
-        if os.path.exists(self.notes_file):
-            try:
-                with open(self.notes_file, "r") as f:
-                    data = json.load(f)
-                    
-                    # Check if migration needed (old format vs new)
-                    # Old format: direct keys "content", "pinned", etc.
-                    # New format: "notes": [], "settings": {}
-                    
-                    if "notes" in data:
-                        # New format
-                        self.notes_data = data.get("notes", [])
-                        settings = data.get("settings", {})
-                        self.is_pinned = settings.get("pinned", False)
-                        self.current_opacity = settings.get("opacity", 240)
-                        self.theme_index = settings.get("theme_index", 0)
-                        self.active_note_id = data.get("active_note_id")
-                    else:
-                        # Legacy format migration
-                        content = data.get("content", "")
-                        note_id = str(uuid.uuid4())
-                        self.notes_data = [{"id": note_id, "content": content, "timestamp": time.time()}]
-                        self.active_note_id = note_id
-                        
-                        self.is_pinned = data.get("pinned", False)
-                        self.current_opacity = data.get("opacity", 240)
-                        self.theme_index = data.get("theme_index", 0)
+    def closeEvent(self, event):
+        StickyNote.active_windows.remove(self)
+        event.accept()
 
-            except Exception as e:
-                print(f"Error loading: {e}")
+    def apply_global_settings(self):
+        s = self.manager.settings
+        self.pin_btn.setChecked(s["pinned"])
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, s["pinned"])
         
-        # Ensure at least one note
-        if not self.notes_data:
-            self.create_new_note(save=False) # Don't save empty immediately
+        # Opacity
+        val = s["opacity"]
+        self.slider.blockSignals(True)
+        self.slider.setValue(val)
+        self.slider.blockSignals(False)
+        self.update_style(val, s["theme_index"])
         
-        # Apply settings
-        self.slider.setValue(self.current_opacity)
-        if self.is_pinned:
-            self.pin_btn.setChecked(True)
-            self.toggle_pin()
-        
-        # Load active note
-        self.load_active_note_content()
-        self.refresh_menu_list()
+        # Re-show if changing flags hides it (sometimes happens with stay-on-top)
+        if self.isVisible():
+            self.show()
 
-    def load_active_note_content(self):
-        # Find note object
-        note = next((n for n in self.notes_data if n["id"] == self.active_note_id), None)
-        if note:
-            self.text_edit.blockSignals(True) # Prevent save loop
-            self.text_edit.setPlainText(note["content"])
-            self.text_edit.blockSignals(False)
-        elif self.notes_data:
-            # Fallback if id not found
-            self.active_note_id = self.notes_data[0]["id"]
-            self.load_active_note_content()
+    def on_settings_atomic_change(self):
+        # Called when another window changes settings
+        self.apply_global_settings()
 
-    def create_new_note(self, save=True):
-        new_id = str(uuid.uuid4())
-        new_note = {"id": new_id, "content": "", "timestamp": time.time()}
-        self.notes_data.insert(0, new_note) # Add to top
-        self.active_note_id = new_id
-        
-        # UI Update
+    def load_content(self):
+        content = self.manager.get_note_content(self.note_id)
         self.text_edit.blockSignals(True)
-        self.text_edit.clear()
+        self.text_edit.setPlainText(content)
         self.text_edit.blockSignals(False)
-        
-        self.refresh_menu_list()
-        if save:
-            self.save_data()
-            
-        # If menu open, auto-close? No, user might want to see it added.
-        # But we should focus text edit
-        self.text_edit.setFocus()
-
-    def refresh_menu_list(self):
-        # Clear existing items
-        layout = self.side_menu.scroll_layout
-        while layout.count() > 1: # Keep the stretch item at end
-            child = layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-        
-        # Add items
-        for note in self.notes_data:
-            item = NoteItemWidget(note["id"], note["content"])
-            item.clicked.connect(self.switch_note)
-            item.delete_clicked.connect(self.delete_note)
-            
-            # Highlight active
-            if note["id"] == self.active_note_id:
-               item.setStyleSheet("NoteItemWidget { background-color: rgba(255, 255, 255, 0.1); border-radius: 5px; }")
-               
-            layout.insertWidget(layout.count()-1, item)
-
-    def switch_note(self, note_id):
-        if note_id == self.active_note_id: return
-        
-        # Current one is already saved via textChange
-        self.active_note_id = note_id
-        self.load_active_note_content()
-        self.refresh_menu_list()
-        self.save_data() # Update active ID in persistence
-
-    def delete_note(self, note_id):
-        # Remove from list
-        self.notes_data = [n for n in self.notes_data if n["id"] != note_id]
-        
-        if not self.notes_data:
-            # Create new one if empty
-            self.create_new_note(save=False)
-        elif note_id == self.active_note_id:
-            # Switch to first
-            self.active_note_id = self.notes_data[0]["id"]
-            self.load_active_note_content()
-            
-        self.refresh_menu_list()
-        self.save_data()
 
     def on_text_changed(self):
         content = self.text_edit.toPlainText()
-        # Update memory
-        for note in self.notes_data:
-            if note["id"] == self.active_note_id:
-                note["content"] = content
-                note["timestamp"] = time.time()
-                break
-        
-        # Debounce logic could go here, but doing direct save is safer for "seamless" feel if small file
-        self.save_data()
-        
-        # Also need to update menu preview if user types first line!
-        # This might be expensive on formatted text, but for plain text it's fast.
-        # We'll just trigger it occasionally or accept it updates on restart/switch?
-        # Let's try to update the specific widget? Too complex.
-        # Just assume menu preview updates on next refresh.
+        self.manager.update_note_content(self.note_id, content)
 
-    def save_data(self):
-        data = {
-            "active_note_id": self.active_note_id,
-            "notes": self.notes_data,
-            "settings": {
-                "pinned": self.is_pinned,
-                "opacity": self.current_opacity,
-                "theme_index": self.theme_index
-            }
-        }
-        try:
-            with open(self.notes_file, "w") as f:
-                json.dump(data, f)
-        except Exception as e:
-            print(f"Error saving: {e}")
+    def on_external_content_change(self, note_id, content):
+        if note_id == self.note_id:
+            if self.text_edit.toPlainText() != content:
+                cursor = self.text_edit.textCursor()
+                self.text_edit.blockSignals(True)
+                self.text_edit.setPlainText(content)
+                self.text_edit.setTextCursor(cursor)
+                self.text_edit.blockSignals(False)
+
+    def on_notes_list_updated(self):
+        # Refresh menu
+        self.side_menu.refresh_list()
+        
+        # Check if our note still exists
+        exists = any(n["id"] == self.note_id for n in self.manager.notes_data)
+        if not exists:
+            # If deleted externally, switch to first available or close? 
+            # Behavior: switch to first available
+            if self.manager.notes_data:
+                self.switch_note(self.manager.notes_data[0]["id"])
+            else:
+                # Should have been recreated by manager, but just in case
+                self.close()
+
+    def create_new_note(self):
+        new_id = self.manager.create_new_note()
+        self.switch_note(new_id)
+
+    def switch_note(self, note_id):
+        if note_id == self.note_id: return
+        self.note_id = note_id
+        self.load_content()
+        self.side_menu.set_current_note(note_id)
+
+    def delete_note(self, note_id):
+        self.manager.delete_note(note_id)
+
+    def open_popout(self, note_id):
+        new_window = StickyNote(self.manager, note_id)
+        new_window.show()
+        # It's added to StickyNote.active_windows in __init__, so it stays alive.
 
     def toggle_menu(self):
         start_w = self.side_menu.width()
         end_w = 150 if start_w == 0 else 0
-        
         self.menu_animation.setStartValue(start_w)
         self.menu_animation.setEndValue(end_w)
         self.menu_animation.start()
-        
         self.menu_open = (end_w != 0)
-        self.refresh_menu_list() # Ensure fresh previews on open
+        if self.menu_open:
+            self.side_menu.refresh_list()
 
-    # --- Style & Boilerplate (Same as before but updated selectors) ---
-    def update_style(self):
-        bg_alpha = self.current_opacity
-        theme = self.THEMES[self.theme_index]
+    def toggle_pin(self):
+        new_state = self.pin_btn.isChecked()
+        self.manager.update_setting("pinned", new_state)
+
+    def cycle_theme(self):
+        new_idx = (self.manager.settings["theme_index"] + 1) % len(self.THEMES)
+        self.manager.update_setting("theme_index", new_idx)
+
+    def update_opacity_val(self, value):
+        self.manager.update_setting("opacity", value)
+
+    def update_style(self, opacity_val, theme_idx):
+        # Curve logic
+        t = (opacity_val - 50) / 205.0
+        if t < 0: t = 0
+        curve_t = t ** 0.4 
+        new_alpha = 50 + (205 * curve_t)
+        bg_alpha = int(new_alpha)
+
+        theme = self.THEMES[theme_idx]
         bg_rgb = theme["bg"]
         text_color = theme["text"]
         border = theme["border"]
@@ -466,37 +535,6 @@ class StickyNote(QMainWindow):
         """
         self.setStyleSheet(style)
 
-    def update_opacity(self, value):
-        # User wants a curve so it doesn't become translucent too quickly.
-        # We map the linear slider value to a non-linear alpha.
-        # Normalize slider (50-255) to 0.0-1.0
-        t = (value - 50) / 205.0
-        if t < 0: t = 0
-        
-        # Apply curve: Power < 1 makes the curve bulge upwards (staying higher for longer)
-        # alpha_factor = t^0.3 (roughly cube root)
-        curve_t = t ** 0.4 
-        
-        # Map back to 50-255
-        new_alpha = 50 + (205 * curve_t)
-        
-        self.current_opacity = int(new_alpha)
-        self.update_style()
-    
-    def cycle_theme(self):
-        self.theme_index = (self.theme_index + 1) % len(self.THEMES)
-        self.update_style()
-        self.save_data() # Save theme immediately
-
-    def toggle_pin(self):
-        self.is_pinned = self.pin_btn.isChecked()
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, self.is_pinned)
-        self.show()
-
-    def close_app(self):
-        self.save_data()
-        self.close()
-
     # Drag Logic
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -510,17 +548,13 @@ class StickyNote(QMainWindow):
         self.old_pos = None
 
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.dirname(os.path.abspath(__file__))
-
     return os.path.join(base_path, relative_path)
 
 if __name__ == "__main__":
-    # Fix Taskbar Icon/Name grouping (Windows specific)
     import ctypes
     myappid = 'chudasmat.klarion.sticky.v1' 
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
@@ -528,11 +562,18 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("klarion")
     
+    # IMPORTANT: Keep app alive until last window closes
+    app.setQuitOnLastWindowClosed(True) 
+    
     icon_path = resource_path("klarion.ico")
     app.setWindowIcon(QIcon(icon_path))
     
-    window = StickyNote()
+    manager = NoteManager()
+    
+    # Create initial window
+    window = StickyNote(manager)
     window.setWindowIcon(QIcon(icon_path))
-    window.setWindowTitle("klarion") # Update title for taskbar text
+    window.setWindowTitle("klarion")
     window.show()
+    
     sys.exit(app.exec())
